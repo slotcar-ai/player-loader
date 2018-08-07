@@ -1,0 +1,9 @@
+# VSCode user-settings
+.vscode/
+
+# Generated build artifacts
+**/bin/
+**/obj/
+
+# Properties and launch settings (possibly filled with secrets)
+**/Properties/
