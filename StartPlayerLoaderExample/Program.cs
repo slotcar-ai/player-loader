@@ -22,13 +22,12 @@ namespace StartPlayerLoaderExample
             queueClient = new QueueClient(serviceBusConnectionString, queueName);
 
             Console.WriteLine("======================================================");
-            Console.WriteLine("Press ENTER key to exit after sending all the messages.");
+            Console.WriteLine("Press ENTER key to exit after sending all the messages");
             Console.WriteLine("======================================================");
 
-            // Send messages.
             Console.WriteLine($"Sending message...");
             
-            await SendMessageAsync("Hei igjen!");
+            await SendMessageAsync("32");
 
             Console.WriteLine($"Message sent!");
 

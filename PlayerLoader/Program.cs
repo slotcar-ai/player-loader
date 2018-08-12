@@ -1,68 +1,54 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.ServiceBus;
+using k8s;
+using k8s.Models;
 
 namespace PlayerLoader
 {
-    class Program
+    public class Program
     {
-        static IQueueClient queueClient;
+        public static IQueueClient queue;
+        public static IKubernetes k8s;
 
-        static void Main(string[] args)
+        public static void Main(string[] args)
         {
-            MainAsync().GetAwaiter().GetResult();
-        }
+            Console.WriteLine("Starting player-loader...");
 
-        static async Task MainAsync()
-        {
+            Console.WriteLine("Configuring Kubernetes client...");
+            var config = KubernetesClientConfiguration.BuildConfigFromConfigFile();
+            k8s = new Kubernetes(config);
+
+            Console.WriteLine("Connecting to Azure Service Bus...");
             var serviceBusConnectionString = Environment.GetEnvironmentVariable("SLOTCAR_AI_SERVICEBUS_KEY_SENDLISTEN");
             var queueName = "player-loader";
-            queueClient = new QueueClient(serviceBusConnectionString, queueName);
-
-            Console.WriteLine("======================================================");
-            Console.WriteLine("Press ENTER key to exit after receiving all the messages.");
-            Console.WriteLine("======================================================");
-
-            // Register QueueClient's MessageHandler and receive messages in a loop
-            RegisterOnMessageHandlerAndReceiveMessages();
-
-            Console.ReadKey();
-
-            await queueClient.CloseAsync();
-        }
-
-        static void RegisterOnMessageHandlerAndReceiveMessages()
-        {
-            // Configure the MessageHandler Options in terms of exception handling, number of concurrent messages to deliver etc.
-            var messageHandlerOptions = new MessageHandlerOptions(ExceptionReceivedHandler)
+            var queueClient = new QueueClient(serviceBusConnectionString, queueName);
+            var options = new MessageHandlerOptions(ExceptionReceivedHandler)
             {
-                // Maximum number of Concurrent calls to the callback `ProcessMessagesAsync`, set to 1 for simplicity.
-                // Set it according to how many messages the application wants to process in parallel.
                 MaxConcurrentCalls = 1,
-
-                // Indicates whether MessagePump should automatically complete the messages after returning from User Callback.
-                // False below indicates the Complete will be handled by the User Callback as in `ProcessMessagesAsync` below.
-                AutoComplete = false
+                AutoComplete = true
             };
+            
+            Console.WriteLine($"Setting up message handler...");
+            queueClient.RegisterMessageHandler(ProcessMessagesAsync, options);
 
-            // Register the function that will process messages
-            queueClient.RegisterMessageHandler(ProcessMessagesAsync, messageHandlerOptions);
+            Console.WriteLine("Press any key to exit.");
+            Console.ReadKey();
         }
 
         static async Task ProcessMessagesAsync(Message message, CancellationToken token)
         {
-            // Process the message
-            Console.WriteLine($"Received message: SequenceNumber:{message.SystemProperties.SequenceNumber} Body:{Encoding.UTF8.GetString(message.Body)}");
+            var messageBody = Encoding.UTF8.GetString(message.Body);
+            Console.WriteLine($"Received message: SequenceNumber:{ message.SystemProperties.SequenceNumber } Body:{ messageBody }");
 
-            // Complete the message so that it is not received again.
-            // This can be done only if the queueClient is created in ReceiveMode.PeekLock mode (which is default).
-            await queueClient.CompleteAsync(message.SystemProperties.LockToken);
+            Console.WriteLine("Loading new race-track and player...");
+            await DeployRaceTrackAndGivenPlayerAsync(messageBody);
 
-            // Note: Use the cancellationToken passed as necessary to determine if the queueClient has already been closed.
-            // If queueClient has already been Closed, you may chose to not call CompleteAsync() or AbandonAsync() etc. calls 
-            // to avoid unnecessary exceptions.
+            Console.WriteLine($"slotcarai/player:{ messageBody } loaded");
         }
 
         static Task ExceptionReceivedHandler(ExceptionReceivedEventArgs exceptionReceivedEventArgs)
@@ -74,6 +60,194 @@ namespace PlayerLoader
             Console.WriteLine($"- Entity Path: {context.EntityPath}");
             Console.WriteLine($"- Executing Action: {context.Action}");
             return Task.CompletedTask;
+        }
+
+        static async Task DeployRaceTrackAndGivenPlayerAsync(string playerTag)
+        {
+            var deployments = await k8s.ListNamespacedDeploymentAsync("default");
+
+            var raceTrackDeployment = RaceTrackDeployment();
+            if (deployments.Items.Any(d => d.Metadata.Name == "race-track"))
+            {
+                await k8s.ReplaceNamespacedDeploymentAsync(raceTrackDeployment, "race-track", "default");
+            }
+            else
+            {
+                await k8s.CreateNamespacedDeploymentAsync(raceTrackDeployment, "default");
+            }
+
+            var raceTrackService = RaceTrackService();
+            // TODO: This is probably worth doing? raceTrackService.Validate();
+            var services = k8s.ListNamespacedService("default");
+            if (!services.Items.Any(s => s.Metadata.Name == "race-track"))
+            {
+                await k8s.CreateNamespacedServiceAsync(raceTrackService, "default");
+            }
+
+            var playerDeployment = PlayerDeployment(playerTag);
+            if (deployments.Items.Any(d => d.Metadata.Name == "player"))
+            {
+                await k8s.ReplaceNamespacedDeploymentAsync(playerDeployment, "player", "default");
+            }
+            else
+            {
+                await k8s.CreateNamespacedDeploymentAsync(playerDeployment, "default");
+            }
+        }
+
+        public static V1Deployment PlayerDeployment(string playerTag)
+        {
+            return new V1Deployment
+            {
+                Metadata = new V1ObjectMeta
+                {
+                    Name = "player",
+                    Labels = new Dictionary<string, string>
+                    {
+                        {"app", "slotcarai"}
+                    }
+                },
+                Spec = new V1DeploymentSpec
+                {
+                    Replicas = 1,
+                    Selector = new V1LabelSelector
+                    {
+                        MatchLabels = new Dictionary<string, string>
+                        {
+                            {"app", "player"}
+                        }
+                    },
+                    Template = new V1PodTemplateSpec
+                    {
+                        Metadata = new V1ObjectMeta
+                        {
+                            Labels = new Dictionary<string, string>
+                            {
+                                {"app", "player"}
+                            }
+                        },
+                        Spec = new V1PodSpec
+                        {
+                            Containers = new List<V1Container>
+                            {
+                                new V1Container
+                                {
+                                    Name = "player",
+                                    Image = $"slotcarai/player:{ playerTag }",
+                                    Ports = new List<V1ContainerPort>
+                                    {
+                                        new V1ContainerPort
+                                        {
+                                            ContainerPort = 11000
+                                        }
+                                    },
+                                    Env = new List<V1EnvVar>
+                                    {
+                                        new V1EnvVar
+                                        {
+                                            Name = "RACE_TRACK_HOSTNAME",
+                                            Value = "race-track"
+                                        },
+                                        new V1EnvVar
+                                        {
+                                            Name = "RACE_TRACK_PORT",
+                                            Value = "11000"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+        }
+
+        public static V1Deployment RaceTrackDeployment()
+        {
+            return new V1Deployment
+            {
+                Metadata = new V1ObjectMeta
+                {
+                    Name = "race-track",
+                    Labels = new Dictionary<string, string>
+                    {
+                        {"app", "slotcarai"}
+                    }
+                },
+                Spec = new V1DeploymentSpec
+                {
+                    Replicas = 1,
+                    Selector = new V1LabelSelector
+                    {
+                        MatchLabels = new Dictionary<string, string>
+                        {
+                            {"app", "race-track"}
+                        }
+                    },
+                    Template = new V1PodTemplateSpec
+                    {
+                        Metadata = new V1ObjectMeta
+                        {
+                            Labels = new Dictionary<string, string>
+                            {
+                                {"app", "race-track"}
+                            }
+                        },
+                        Spec = new V1PodSpec
+                        {
+                            Containers = new List<V1Container>
+                            {
+                                new V1Container
+                                {
+                                    Name = "race-track",
+                                    Image = "slotcarai/race-track:25",
+                                    Ports = new List<V1ContainerPort>
+                                    {
+                                        new V1ContainerPort
+                                        {
+                                            ContainerPort = 11000
+                                        }
+                                    },
+                                    Env = new List<V1EnvVar>
+                                    {
+                                        new V1EnvVar
+                                        {
+                                            Name = "RACE_TRACK_PORT",
+                                            Value = "11000"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+        }
+
+        public static V1Service RaceTrackService()
+        {
+            return new V1Service
+            {
+                Metadata = new V1ObjectMeta
+                {
+                    Name = "race-track"
+                },
+                Spec = new V1ServiceSpec
+                {
+                    Selector = new Dictionary<string, string>
+                    {
+                        {"app", "race-track"}
+                    },
+                    Ports = new List<V1ServicePort>
+                    {
+                        new V1ServicePort
+                        {
+                            Name = "slotcarai-race-track",
+                            Port = 11000
+                        }
+                    }
+                }
+            };
         }
     }
 }
